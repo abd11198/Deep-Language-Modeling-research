@@ -1,0 +1,173 @@
+import numpy as np
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Embedding, LSTM, Dense, Concatenate, RepeatVector, Flatten
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+import random
+
+
+def preprocess(formal_sentences, informal_sentences, shakes_sentences, seq_length=5):
+    
+    styles = (
+        ["formal"] * len(formal_sentences)
+        + ["informal"] * len(informal_sentences)
+        + ["shakespearean"] * len(shakes_sentences)
+    )
+    sentences = formal_sentences + informal_sentences + shakes_sentences
+    style_to_idx = {"formal": 0, "informal": 1, "shakespearean": 2}
+    
+    tokenizer = Tokenizer()
+    tokenizer.fit_on_texts(sentences)
+    word_to_idx = tokenizer.word_index
+    idx_to_word = {idx: word for word, idx in word_to_idx.items()}
+    vocab_size = len(word_to_idx) + 1
+    
+    formal_vocab = set([idx for seq in tokenizer.texts_to_sequences(formal_sentences) for idx in seq])
+    informal_vocab = set([idx for seq in tokenizer.texts_to_sequences(informal_sentences) for idx in seq])
+    shakes_vocab = set([idx for seq in tokenizer.texts_to_sequences(shakes_sentences) for idx in seq])
+    style_vocab = {
+        0: formal_vocab,
+        1: informal_vocab,
+        2: shakes_vocab
+    }
+    
+    encoded_texts = tokenizer.texts_to_sequences(sentences)
+    encoded_styles = [style_to_idx[style] for style in styles]
+    X_text, X_style, y = [], [], []
+    
+    for i, seq in enumerate(encoded_texts):
+        for j in range(len(seq) - seq_length):
+            X_text.append(seq[j:j + seq_length])
+            X_style.append(encoded_styles[i])
+            y.append(seq[j + seq_length])
+            
+    X_text = np.array(X_text)
+    X_style = np.array(X_style)
+    y = to_categorical(y, num_classes=vocab_size)
+    
+    return {
+        "X_text": X_text,
+        "X_style": X_style,
+        "y": y,
+        "tokenizer": tokenizer,
+        "word_to_idx": word_to_idx,
+        "idx_to_word": idx_to_word,
+        "style_to_idx": style_to_idx,
+        "vocab_size": vocab_size,
+        "style_vocab": style_vocab
+    }
+
+
+def create_RNN(vocab_size, num_styles, seq_length):
+    """
+    Create an RNN model for text generation with style conditioning.
+    """
+    text_input = Input(shape=(seq_length,), name="text_input")
+    style_input = Input(shape=(1,), name="style_input")
+
+    text_embedding = Embedding(input_dim=vocab_size, output_dim=128)(text_input)
+    style_embedding = Embedding(input_dim=num_styles, output_dim=32)(style_input)
+    style_embedding = Flatten()(style_embedding)
+    style_embedding_repeated = RepeatVector(seq_length)(style_embedding)
+
+    combined_input = Concatenate()([text_embedding, style_embedding_repeated])
+    x = LSTM(256, return_sequences=False)(combined_input)
+    output = Dense(vocab_size, activation="softmax")(x)
+
+    model = Model(inputs=[text_input, style_input], outputs=output)
+    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+    return model
+
+
+def training(model, data, epochs=10, batch_size=32):
+    """
+    Train the model on the provided dataset.
+    """
+    X_text = data["X_text"]
+    X_style = np.expand_dims(data["X_style"], axis=-1) 
+    y = data["y"]
+
+    model.fit([X_text, X_style], y, epochs=epochs, batch_size=batch_size, verbose=0)
+    print("Training complete.")
+
+
+def select_seed_by_style(data, style_id):
+    """
+    Select a random seed sequence from the dataset for a specific style.
+    """
+    indices = [i for i, style in enumerate(data["X_style"]) if style == style_id]
+    random_index = random.choice(indices)
+    return data["X_text"][random_index]
+
+def generate_stylistic_text(model, data, style_id, seq_length=5, gen_length=20, temperature=0.9):
+    """
+    Generate stylistic text based on a seed sequence and style ID.
+    """
+    style_vocab = data["style_vocab"]
+    idx_to_word = data["idx_to_word"]
+    seed_sequence = select_seed_by_style(data, style_id)
+    
+    seed_text = " ".join([idx_to_word.get(idx, "") for idx in seed_sequence]).capitalize()
+    generated_text = seed_text
+    encoded_seed = seed_sequence.tolist()
+    
+    for _ in range(gen_length):
+        padded_seed = pad_sequences([encoded_seed], maxlen=seq_length, truncating="pre")
+        style_input = np.array([[style_id]])  
+        predictions = model.predict([padded_seed, style_input], verbose=0)[0]
+        predictions = np.log(predictions + 1e-8) / temperature
+        probabilities = np.exp(predictions) / np.sum(np.exp(predictions))
+        
+        allowed_indices = list(style_vocab[style_id])
+        probabilities = [prob if idx in allowed_indices else 0 for idx, prob in enumerate(probabilities)]
+        probabilities = np.array(probabilities) / np.sum(probabilities) 
+        
+        next_idx = np.random.choice(len(probabilities), p=probabilities)
+        next_word = idx_to_word.get(next_idx, "")
+        
+        generated_text += " " + next_word
+        encoded_seed.append(next_idx)
+        encoded_seed = encoded_seed[-seq_length:]
+        
+    return generated_text
+
+
+path = 'formal_text.txt'
+with open(path, "r", encoding='utf-8') as formal_txt:
+    formals = [line[5:] for line in formal_txt.readlines()]
+path = 'informal_text.txt'
+with open(path, "r", encoding='utf-8') as informal_txt:
+    informals = [line[5:] for line in informal_txt.readlines()]
+path = 'shakespeare_text.txt'
+with open(path, "r", encoding='utf-8') as shakes_txt:
+    shakes = [line[5:] for line in shakes_txt.readlines()]
+
+dataset = {
+    "formal_sentences": formals[:4000],
+    "informal_sentences": informals[:4000],
+    "shakes_sentences": shakes[:4000],
+}
+
+seq_length = 5
+data = preprocess(dataset["formal_sentences"], dataset["informal_sentences"], dataset["shakes_sentences"], seq_length)
+model = create_RNN(data["vocab_size"], num_styles=3, seq_length=seq_length)
+
+training(model, data)
+
+with open('generated_formals.txt','w', encoding='utf-8') as f:
+    for i in range(2):
+        generated_text = generate_stylistic_text(model, data, 0, seq_length=seq_length, gen_length=20, temperature=1)
+        f.write(f"{generated_text}\n")
+print ("Done writing formal file.")
+with open('generated_informals.txt','w', encoding='utf-8') as f:
+    for i in range(2):
+        generated_text = generate_stylistic_text(model, data, 1, seq_length=seq_length, gen_length=20, temperature=1)
+        f.write(f"{generated_text}\n")
+print ("Done writing informal file.")
+with open('generated_shakes.txt','w', encoding='utf-8') as f:
+    for i in range(2):
+        generated_text = generate_stylistic_text(model, data, 2, seq_length=seq_length, gen_length=20, temperature=1)
+        f.write(f"{generated_text}\n")
+print ("Done writing shakes file.")
+
